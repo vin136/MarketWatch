@@ -126,7 +126,14 @@ def _status_page(portfolio_dir: Path) -> None:
             ohlc = provider.get_ohlc(symbol, start_price_window, today)
             if not ohlc:
                 continue
-            last_close = ohlc[-1].close
+            last_bar = ohlc[-1]
+            # If cached data is stale, ask provider for an updated range.
+            if last_bar.date < today:
+                ohlc = provider.get_ohlc(symbol, last_bar.date, today)
+                if not ohlc:
+                    continue
+                last_bar = ohlc[-1]
+            last_close = last_bar.close
             last_prices[symbol] = last_close
             total_value += pos.quantity * last_close
 
@@ -143,6 +150,9 @@ def _status_page(portfolio_dir: Path) -> None:
                 max_weight_pct = default_max_weight_pct
             price = last_prices.get(symbol)
             value = pos.quantity * price if price is not None else None
+            pnl = None
+            if price is not None and pos.cost_basis is not None:
+                pnl = pos.quantity * (price - pos.cost_basis)
             weight_pct = (
                 (value / total_value) * 100.0 if value is not None and total_value > 0 else None
             )
@@ -154,6 +164,8 @@ def _status_page(portfolio_dir: Path) -> None:
                     "Cost Basis": pos.cost_basis,
                     "Capital": value,
                     "Weight (%)": weight_pct,
+                    "Last Price": price,
+                    "PnL": pnl,
                     "Buy Target": getattr(cfg, "buy_target", None),
                     "Sell Target": getattr(cfg, "sell_target", None),
                     "Intrinsic": getattr(cfg, "intrinsic_value", None),
@@ -173,6 +185,7 @@ def _status_page(portfolio_dir: Path) -> None:
                 max_weight_pct = cfg.max_weight * 100.0
             else:
                 max_weight_pct = default_max_weight_pct
+            price = last_prices.get(symbol)
             rows.append(
                 {
                     "Type": "Watchlist",
@@ -181,6 +194,8 @@ def _status_page(portfolio_dir: Path) -> None:
                     "Cost Basis": None,
                     "Capital": None,
                     "Weight (%)": None,
+                    "Last Price": price,
+                    "PnL": None,
                     "Buy Target": cfg.buy_target,
                     "Sell Target": cfg.sell_target,
                     "Intrinsic": cfg.intrinsic_value,
@@ -196,6 +211,8 @@ def _status_page(portfolio_dir: Path) -> None:
                 "Cost Basis": row["Cost Basis"],
                 "Capital": row["Capital"],
                 "Weight (%)": row["Weight (%)"],
+                "Last Price": row.get("Last Price"),
+                "PnL": row.get("PnL"),
             }
             for row in rows
         ]
@@ -215,6 +232,14 @@ def _status_page(portfolio_dir: Path) -> None:
                 "Weight (%)": st.column_config.NumberColumn(
                     "Weight (%)",
                     help="Approximate current portfolio weight for this position (including cash in denominator).",
+                ),
+                "Last Price": st.column_config.NumberColumn(
+                    "Last Price",
+                    help="Most recent close price from the price provider (may be the last trading day if today is a holiday/weekend).",
+                ),
+                "PnL": st.column_config.NumberColumn(
+                    "PnL",
+                    help="Unrealized PnL in USD based on last price and current cost basis.",
                 ),
             },
         )

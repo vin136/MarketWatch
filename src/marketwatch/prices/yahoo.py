@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from pathlib import Path
 from typing import List
@@ -12,6 +13,8 @@ except ImportError:  # pragma: no cover - handled at call time
     yf = None  # type: ignore[assignment]
 
 from marketwatch.prices.base import Dividend, OHLC, PriceProvider, Split
+
+logger = logging.getLogger(__name__)
 
 
 class YahooPriceProvider(PriceProvider):
@@ -31,20 +34,30 @@ class YahooPriceProvider(PriceProvider):
         result: list[OHLC] = []
         with path.open("r", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
-            for row in reader:
+            for row_num, row in enumerate(reader, 2):  # Header is row 1
                 try:
                     d = date.fromisoformat(str(row["date"]))
-                    result.append(
-                        OHLC(
-                            date=d,
-                            open=float(row["open"]),
-                            high=float(row["high"]),
-                            low=float(row["low"]),
-                            close=float(row["close"]),
-                            volume=float(row["volume"]) if row.get("volume") not in (None, "") else None,
-                        )
+                    ohlc = OHLC(
+                        date=d,
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=float(row["volume"]) if row.get("volume") not in (None, "") else None,
                     )
-                except Exception:  # noqa: BLE001
+                    # OHLC sanity checks
+                    if not (ohlc.low <= ohlc.high):
+                        logger.warning(f"OHLC sanity check failed at {path}:{row_num} - low > high")
+                        continue
+                    if not (ohlc.low <= ohlc.open <= ohlc.high):
+                        logger.warning(f"OHLC sanity check failed at {path}:{row_num} - open outside range")
+                        continue
+                    if not (ohlc.low <= ohlc.close <= ohlc.high):
+                        logger.warning(f"OHLC sanity check failed at {path}:{row_num} - close outside range")
+                        continue
+                    result.append(ohlc)
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.warning(f"Error parsing OHLC at {path}:{row_num}: {e}")
                     continue
         return result
 
@@ -72,11 +85,16 @@ class YahooPriceProvider(PriceProvider):
         result: list[Dividend] = []
         with path.open("r", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
-            for row in reader:
+            for row_num, row in enumerate(reader, 2):
                 try:
                     d = date.fromisoformat(str(row["date"]))
-                    result.append(Dividend(date=d, amount=float(row["amount"])))
-                except Exception:  # noqa: BLE001
+                    amount = float(row["amount"])
+                    if amount < 0:
+                        logger.warning(f"Negative dividend at {path}:{row_num} - skipping")
+                        continue
+                    result.append(Dividend(date=d, amount=amount))
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.warning(f"Error parsing dividend at {path}:{row_num}: {e}")
                     continue
         return result
 
@@ -95,11 +113,16 @@ class YahooPriceProvider(PriceProvider):
         result: list[Split] = []
         with path.open("r", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
-            for row in reader:
+            for row_num, row in enumerate(reader, 2):
                 try:
                     d = date.fromisoformat(str(row["date"]))
-                    result.append(Split(date=d, ratio=float(row["ratio"])))
-                except Exception:  # noqa: BLE001
+                    ratio = float(row["ratio"])
+                    if ratio <= 0:
+                        logger.warning(f"Invalid split ratio at {path}:{row_num} - skipping")
+                        continue
+                    result.append(Split(date=d, ratio=ratio))
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.warning(f"Error parsing split at {path}:{row_num}: {e}")
                     continue
         return result
 

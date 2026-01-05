@@ -11,6 +11,14 @@ import typer
 
 from marketwatch.core.events import Event
 from marketwatch.core.state import build_snapshot
+from marketwatch.core.validation import (
+    ValidationError,
+    validate_finite,
+    validate_positive,
+    validate_quantity_delta,
+    validate_weight,
+    validate_targets,
+)
 from marketwatch.core.analytics import (
     compute_whatsup,
     compute_invest_suggestions,
@@ -60,7 +68,7 @@ def init(
 
     with csv_file.open("r", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
-        for row in reader:
+        for row_num, row in enumerate(reader, 2):  # Start at 2 (header is row 1)
             symbol = (row.get("Symbol") or "").strip()
             if not symbol:
                 continue
@@ -68,8 +76,21 @@ def init(
             cost_str = (row.get("Cost Price") or "").replace(",", "").strip()
             if not quantity_str or not cost_str:
                 continue
-            quantity = float(quantity_str)
-            cost_price = float(cost_str)
+            try:
+                quantity = float(quantity_str)
+                cost_price = float(cost_str)
+            except ValueError as exc:
+                typer.echo(f"Warning: Skipping row {row_num} - invalid number format")
+                continue
+
+            # Validate inputs
+            try:
+                validate_positive(quantity, f"Quantity for {symbol}")
+                validate_positive(cost_price, f"Cost Price for {symbol}")
+            except ValidationError as exc:
+                typer.echo(f"Warning: Skipping row {row_num} - {exc}")
+                continue
+
             if symbol.upper() == "CASH":
                 amount = quantity * cost_price
                 events.append(
@@ -134,6 +155,12 @@ def add(
 
     timestamp = datetime.utcnow()
 
+    # Validate inputs
+    try:
+        validate_finite(units, "units")
+    except ValidationError as exc:
+        raise typer.BadParameter(str(exc))
+
     events: list[Event] = []
     if symbol.lower() == "cash":
         event = Event(
@@ -147,6 +174,14 @@ def add(
     else:
         if cost_basis is None:
             raise typer.BadParameter("COST_BASIS is required for non-cash symbols.")
+
+        # Validate trade inputs
+        try:
+            validate_quantity_delta(units, "units")
+            validate_positive(cost_basis, "cost_basis")
+        except ValidationError as exc:
+            raise typer.BadParameter(str(exc))
+
         event = Event(
             id=str(uuid.uuid4()),
             timestamp=timestamp,
@@ -209,6 +244,13 @@ def trade(
 
     ledger_path = portfolio_dir / "ledger.jsonl"
     timestamp = _parse_date(date_str)
+
+    # Validate inputs
+    try:
+        validate_positive(cash_needed, "cash_needed")
+        validate_finite(pnl, "pnl")
+    except ValidationError as exc:
+        raise typer.BadParameter(str(exc))
 
     event = Event(
         id=str(uuid.uuid4()),
@@ -278,6 +320,21 @@ def config_set_target(
 
     config_path = portfolio_dir / "config.json"
     ledger_path = portfolio_dir / "ledger.jsonl"
+
+    # Validate inputs
+    try:
+        if buy is not None:
+            validate_positive(buy, "buy_target")
+        if sell is not None:
+            validate_positive(sell, "sell_target")
+        if intrinsic is not None:
+            validate_positive(intrinsic, "intrinsic_value")
+        if max_weight is not None:
+            validate_weight(max_weight, "max_weight")
+        # Validate buy/sell target relationship
+        validate_targets(buy, sell)
+    except ValidationError as exc:
+        raise typer.BadParameter(str(exc))
 
     config = load_config(config_path)
     if config is None:
@@ -601,6 +658,121 @@ def ui(
     ]
     typer.echo("Launching Streamlit UI...")
     subprocess.run(cmd, check=False)
+
+
+@app.command("sync-dividends")
+def sync_dividends(
+    start_date: Optional[str] = typer.Option(
+        None,
+        "--start",
+        help="Start date (YYYY-MM-DD). Defaults to earliest event date.",
+    ),
+    portfolio: Optional[str] = typer.Option(
+        None,
+        "--portfolio",
+        "-p",
+        help="Portfolio name (defaults to current portfolio).",
+    ),
+    directory: Optional[Path] = typer.Option(
+        None,
+        "--dir",
+        help="Portfolio directory (defaults to ~/.marketwatch/<portfolio> or current).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show what would be recorded without actually recording.",
+    ),
+) -> None:
+    """Fetch and record dividend events from Yahoo Finance for all positions."""
+    try:
+        portfolio_dir = get_portfolio_dir(name=portfolio, directory=directory)
+    except RuntimeError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1)
+
+    ledger_path = portfolio_dir / "ledger.jsonl"
+    events = list(read_events(ledger_path))
+
+    if not events:
+        typer.echo("No events found. Initialize portfolio first.")
+        raise typer.Exit(code=1)
+
+    snapshot = build_snapshot(events)
+
+    if not snapshot.positions:
+        typer.echo("No positions found in portfolio.")
+        raise typer.Exit(code=0)
+
+    # Determine date range
+    if start_date:
+        try:
+            start = date.fromisoformat(start_date)
+        except ValueError:
+            raise typer.BadParameter(f"Invalid date format: {start_date}")
+    else:
+        start = min(e.timestamp.date() for e in events)
+
+    end = date.today()
+
+    # Get existing dividend events to avoid duplicates
+    existing_dividends: set[tuple[str, date]] = set()
+    for e in events:
+        if e.type == "dividend":
+            symbol = e.payload.get("symbol")
+            if symbol:
+                existing_dividends.add((symbol, e.timestamp.date()))
+
+    # Fetch dividends for each position
+    provider = YahooPriceProvider(cache_dir=portfolio_dir / "price_cache")
+    new_events: list[Event] = []
+
+    for symbol, position in snapshot.positions.items():
+        try:
+            dividends = provider.get_dividends(symbol, start, end)
+        except Exception as exc:
+            typer.echo(f"Warning: Could not fetch dividends for {symbol}: {exc}")
+            continue
+
+        for div in dividends:
+            # Skip if already recorded
+            if (symbol, div.date) in existing_dividends:
+                continue
+
+            # Calculate total dividend based on position quantity
+            # Note: This is approximate - ideally we'd track quantity at dividend date
+            amount = position.quantity * div.amount
+
+            new_events.append(Event(
+                id=str(uuid.uuid4()),
+                timestamp=datetime.combine(div.date, datetime.min.time()),
+                type="dividend",
+                payload={
+                    "symbol": symbol,
+                    "dividend_amount": amount,
+                    "dividend_per_share": div.amount,
+                },
+                note=f"Auto-synced dividend: {div.amount:.4f} per share",
+            ))
+
+    if not new_events:
+        typer.echo("No new dividends to record.")
+        raise typer.Exit(code=0)
+
+    # Sort by date
+    new_events.sort(key=lambda e: e.timestamp)
+
+    if dry_run:
+        typer.echo(f"Would record {len(new_events)} dividend event(s):")
+        for e in new_events:
+            symbol = e.payload.get("symbol")
+            amount = e.payload.get("dividend_amount", 0)
+            typer.echo(f"  {e.timestamp.date()} {symbol}: ${amount:.2f}")
+    else:
+        append_events(ledger_path, new_events)
+        typer.echo(f"Recorded {len(new_events)} dividend event(s).")
+        total = sum(e.payload.get("dividend_amount", 0) for e in new_events)
+        typer.echo(f"Total dividends: ${total:.2f}")
 
 
 @app.command()

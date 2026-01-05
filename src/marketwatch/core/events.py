@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, TypedDict, Iterable, List
+from typing import Any, Literal, TypedDict, Iterable, List, get_args
 
 EventType = Literal[
     "init_position",
@@ -11,7 +11,17 @@ EventType = Literal[
     "generic_trade",
     "config_change",
     "correction",
+    "dividend",
 ]
+
+# Valid event types for validation
+VALID_EVENT_TYPES = get_args(EventType)
+
+
+class EventValidationError(ValueError):
+    """Raised when event data fails validation."""
+
+    pass
 
 
 class EventPayload(TypedDict, total=False):
@@ -32,6 +42,9 @@ class EventPayload(TypedDict, total=False):
     target_event_id: str
     correction_type: Literal["replace", "invalidate"]
     new_payload: dict[str, Any] | None
+    # Dividend fields
+    dividend_amount: float
+    dividend_per_share: float
 
 
 @dataclass(slots=True)
@@ -53,14 +66,49 @@ class Event:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Event:
+        """
+        Parse an Event from a dictionary.
+
+        Validates required fields and raises EventValidationError if invalid.
+
+        Args:
+            data: Dictionary containing event data
+
+        Returns:
+            Event instance
+
+        Raises:
+            EventValidationError: If required fields are missing or invalid
+        """
+        # Validate required fields
+        for field in ("id", "timestamp", "type"):
+            if field not in data:
+                raise EventValidationError(f"Missing required field: {field}")
+
+        # Validate event type
+        event_type = data["type"]
+        if event_type not in VALID_EVENT_TYPES:
+            raise EventValidationError(
+                f"Invalid event type: {event_type}. "
+                f"Must be one of: {', '.join(VALID_EVENT_TYPES)}"
+            )
+
+        # Parse and validate timestamp
         timestamp_str = data["timestamp"]
-        timestamp = datetime.fromisoformat(timestamp_str)
+        try:
+            timestamp = datetime.fromisoformat(timestamp_str)
+        except (ValueError, TypeError) as e:
+            raise EventValidationError(
+                f"Invalid timestamp format: {timestamp_str}. Expected ISO format."
+            ) from e
+
         payload_raw = data.get("payload", {}) or {}
         payload: EventPayload = EventPayload(**payload_raw)
+
         return cls(
             id=str(data["id"]),
             timestamp=timestamp,
-            type=data["type"],
+            type=event_type,
             payload=payload,
             note=data.get("note"),
         )

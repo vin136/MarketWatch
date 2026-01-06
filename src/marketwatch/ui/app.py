@@ -10,6 +10,8 @@ import shutil
 import uuid
 
 import streamlit as st
+import altair as alt
+import pandas as pd
 
 from marketwatch.core.analytics import (
     compute_invest_suggestions,
@@ -217,9 +219,11 @@ def _status_page(portfolio_dir: Path) -> None:
             for row in rows
         ]
 
-        st.dataframe(
+        selection = st.dataframe(
             display_rows,
             hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
             column_config={
                 "Type": st.column_config.TextColumn(
                     "Type",
@@ -243,6 +247,60 @@ def _status_page(portfolio_dir: Path) -> None:
                 ),
             },
         )
+
+        # Show price history chart when a row is selected.
+        if selection and selection.selection and selection.selection.rows:
+            selected_idx = selection.selection.rows[0]
+            selected_row = display_rows[selected_idx]
+            selected_symbol = selected_row["Symbol"]
+            selected_qty = selected_row["Quantity"]
+
+            if selected_qty and selected_qty > 0:
+                st.subheader(f"{selected_symbol} Price History")
+
+                # Get price history from init date to today.
+                # Use lookback to capture last trading day before init if init was on weekend.
+                from datetime import timedelta
+                events = list(read_events(portfolio_dir / "ledger.jsonl"))
+                if events:
+                    init_date = min(e.timestamp.date() for e in events)
+                    lookback_date = init_date - timedelta(days=10)
+                    ohlc_raw = provider.get_ohlc(selected_symbol, lookback_date, today)
+                    # Filter to only include the last price before/on init date, plus all after.
+                    ohlc = []
+                    if ohlc_raw:
+                        # Find last trading day on or before init_date.
+                        bars_before = [b for b in ohlc_raw if b.date <= init_date]
+                        bars_after = [b for b in ohlc_raw if b.date > init_date]
+                        if bars_before:
+                            ohlc.append(bars_before[-1])  # Last bar before/on init
+                        ohlc.extend(bars_after)
+
+                    if ohlc:
+                        df = pd.DataFrame({
+                            "Date": [bar.date.strftime("%Y-%m-%d") for bar in ohlc],
+                            "Price": [bar.close for bar in ohlc],
+                            "Value": [bar.close * selected_qty for bar in ohlc],
+                        })
+
+                        # Single line chart showing Position Value with hover showing both Price and Value.
+                        chart = alt.Chart(df).mark_line(point=True, color="#1f77b4").encode(
+                            x=alt.X("Date:O", title="Date", axis=alt.Axis(labelAngle=0)),
+                            y=alt.Y("Value:Q", title="Position Value ($)"),
+                            tooltip=[
+                                alt.Tooltip("Date:O", title="Date"),
+                                alt.Tooltip("Price:Q", title="Price", format="$,.2f"),
+                                alt.Tooltip("Value:Q", title="Position Value", format="$,.2f"),
+                            ],
+                        ).properties(
+                            height=350,
+                        ).interactive()
+
+                        st.altair_chart(chart, use_container_width=True)
+                    else:
+                        st.info(f"No price history available for {selected_symbol}.")
+            else:
+                st.info("Select a position (not watchlist) to see price history.")
 
         st.caption(
             "To add a pure watchlist ticker, either configure it in 'Edit targets and weights' "
@@ -420,8 +478,22 @@ def _status_page(portfolio_dir: Path) -> None:
             else:
                 st.info("No changes to save.")
 
-    st.subheader("Cash")
-    st.metric("Cash balance", f"{snapshot.cash:,.2f} USD")
+    st.subheader("Cash & PnL")
+    total_pnl = sum(
+        row.get("PnL") for row in rows if row.get("PnL") is not None
+    )
+    col_cash, col_pnl = st.columns([1, 1])
+    with col_cash:
+        st.metric("Cash balance", f"{snapshot.cash:,.2f} USD")
+    with col_pnl:
+        pnl_color = "green" if total_pnl >= 0 else "red"
+        st.markdown(
+            f'<div style="text-align: right;">'
+            f'<span style="font-size: 14px; color: gray;">Total PnL</span><br>'
+            f'<span style="font-size: 28px; font-weight: 600; color: {pnl_color};">'
+            f'{total_pnl:+,.2f} USD</span></div>',
+            unsafe_allow_html=True,
+        )
 
     st.subheader("Add cash or trade")
     col_add, col_generic = st.columns(2)

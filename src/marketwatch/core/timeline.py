@@ -68,7 +68,9 @@ def build_daily_series(
         day_events.setdefault(d, []).append(event)
 
     # Fetch SPY to determine actual trading date range (handles weekends/holidays).
-    spy_prices_full = _prices_by_date(provider, "SPY", start_date, end_date)
+    # Look back a few extra days to capture the last trading day before start_date.
+    lookback_start = start_date - timedelta(days=10)
+    spy_prices_full = _prices_by_date(provider, "SPY", lookback_start, end_date)
     if not spy_prices_full:
         return None
 
@@ -79,13 +81,13 @@ def build_daily_series(
     series_start = trading_dates[0]
     series_end = trading_dates[-1]
 
-    # Pre-fetch symbol prices on the trading window.
+    # Pre-fetch symbol prices including lookback period for init valuation.
     price_map: dict[str, dict[date, float]] = {
-        sym: _prices_by_date(provider, sym, series_start, series_end)
+        sym: _prices_by_date(provider, sym, lookback_start, series_end)
         for sym in symbols
     }
     spy_prices = {d: p for d, p in spy_prices_full.items() if series_start <= d <= series_end}
-    qqq_prices = _prices_by_date(provider, "QQQ", series_start, series_end)
+    qqq_prices = _prices_by_date(provider, "QQQ", lookback_start, series_end)
 
     # Pre-fetch splits so that stock splits are reflected in portfolio value.
     splits_map: dict[str, dict[date, float]] = {}
@@ -114,11 +116,15 @@ def build_daily_series(
     qqq_units = 0.0
     fd_balance = 0.0
 
+    # Track if there are events before the first trading day.
+    has_pre_trading_events = False
+
     # First, process all events strictly before the first trading day to build initial state.
     current = start_date
     while current < series_start:
         todays_events = day_events.get(current, [])
         for event in todays_events:
+            has_pre_trading_events = True
             if event.type == "cash_movement":
                 amount = float(event.payload.get("amount", 0.0) or 0.0)
                 cash += amount
@@ -140,9 +146,52 @@ def build_daily_series(
                     positions[sym] = positions.get(sym, 0.0) + delta
         current += timedelta(days=1)
 
+    # If there were events before the first trading day, prepend a "day 0" using the
+    # most recent available market prices (i.e., last trading day before init date).
+    if has_pre_trading_events:
+        # Find the last trading day before series_start to get prices.
+        last_trading_before_init = None
+        for d in sorted(spy_prices_full.keys(), reverse=True):
+            if d < series_start:
+                last_trading_before_init = d
+                break
+
+        if last_trading_before_init is not None:
+            # Value positions at the last available market prices before init.
+            init_holdings_value = 0.0
+            for sym, qty in positions.items():
+                if qty == 0.0:
+                    continue
+                sym_prices = price_map.get(sym, {})
+                # Find the most recent price on or before last_trading_before_init.
+                price_for_init = None
+                for d in sorted(sym_prices.keys(), reverse=True):
+                    if d <= last_trading_before_init:
+                        price_for_init = sym_prices[d]
+                        break
+                if price_for_init is not None:
+                    init_holdings_value += qty * price_for_init
+
+            init_value = cash + init_holdings_value
+            if init_value > 0:
+                dates.append(start_date)
+                portfolio_values.append(init_value)
+                # Baselines start at same value for fair comparison.
+                spy_series.append(init_value)
+                qqq_series.append(init_value)
+                fd_series.append(init_value)
+                # Initialize baseline units using last trading day prices.
+                spy_price_init = spy_prices_full.get(last_trading_before_init)
+                qqq_price_init = qqq_prices.get(last_trading_before_init)
+                if spy_price_init:
+                    spy_units = init_value / spy_price_init
+                if qqq_price_init:
+                    qqq_units = init_value / qqq_price_init
+                fd_balance = init_value
+
     # Now build daily series from first trading day onwards.
     current = series_start
-    first_day = True
+    first_day = not has_pre_trading_events  # Not first day if we already added init value
     while current <= series_end:
         todays_events = day_events.get(current, [])
         external_flow = 0.0

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List
 import csv
@@ -160,7 +160,8 @@ class YahooPriceProvider(PriceProvider):
             for s, e in missing_ranges:
                 if s >= e:
                     continue
-                hist = ticker.history(start=s, end=e, auto_adjust=False)
+                # Yahoo Finance 'end' is exclusive, so add 1 day to include the end date
+                hist = ticker.history(start=s, end=e + timedelta(days=1), auto_adjust=False)
                 for idx, row in hist.iterrows():
                     ts = idx.to_pydatetime()
                     bar_date = ts.date() if hasattr(ts, "date") else ts
